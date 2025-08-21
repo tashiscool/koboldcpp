@@ -144,12 +144,15 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     std::string t5xxl_filename = inputs.t5xxl_filename;
     std::string clipl_filename = inputs.clipl_filename;
     std::string clipg_filename = inputs.clipg_filename;
+    std::string lora_model_dir = inputs.lora_model_dir;
     std::string photomaker_filename = inputs.photomaker_filename;
     cfg_tiled_vae_threshold = inputs.tiled_vae_threshold;
     cfg_tiled_vae_threshold = (cfg_tiled_vae_threshold > 8192 ? 8192 : cfg_tiled_vae_threshold);
     cfg_tiled_vae_threshold = (cfg_tiled_vae_threshold <= 0 ? 8192 : cfg_tiled_vae_threshold); //if negative dont tile
     cfg_side_limit = inputs.img_hard_limit;
     cfg_square_limit = inputs.img_soft_limit;
+    printf("🔥 LOAD DEBUG: Set cfg_side_limit=%d (from inputs.img_hard_limit=%d), cfg_square_limit=%d (from inputs.img_soft_limit=%d)\n", 
+           cfg_side_limit, inputs.img_hard_limit, cfg_square_limit, inputs.img_soft_limit);
     printf("\nImageGen Init - Load Model: %s\n",inputs.model_filename);
 
     if(lorafilename!="")
@@ -228,6 +231,7 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     sd_params->t5xxl_path = t5xxl_filename;
     sd_params->clip_l_path = clipl_filename;
     sd_params->clip_g_path = clipg_filename;
+    sd_params->lora_model_dir = lora_model_dir;
     sd_params->stacked_id_embeddings_path = photomaker_filename;
     //if t5 is set, and model is a gguf, load it as a diffusion model path
     bool endswithgguf = (sd_params->model_path.rfind(".gguf") == sd_params->model_path.size() - 5);
@@ -357,14 +361,29 @@ static inline int roundnearest(int multiple, int n) {
 //square limit = total NxN resolution based limit to also apply
 static void sd_fix_resolution(int &width, int &height, int img_hard_limit, int img_soft_limit) {
 
+    printf("\n🔥 SD_FIX_RESOLUTION DEBUG 1: === RESOLUTION FIXING PROCESS ===\n");
+    printf("🔥 SD_FIX_RESOLUTION DEBUG 1a: INPUT: width=%d, height=%d\n", width, height);
+    printf("🔥 SD_FIX_RESOLUTION DEBUG 1b: img_hard_limit=%d, img_soft_limit=%d\n", img_hard_limit, img_soft_limit);
+
     // sanitize the original values
+    int original_width = width;
+    int original_height = height;
     width = std::max(std::min(width, 8192), 64);
     height = std::max(std::min(height, 8192), 64);
+    
+    if (original_width != width || original_height != height) {
+        printf("🔥 SD_FIX_RESOLUTION DEBUG 2: SANITIZED: %dx%d -> %dx%d\n", original_width, original_height, width, height);
+    } else {
+        printf("🔥 SD_FIX_RESOLUTION DEBUG 2: No sanitization needed\n");
+    }
 
     bool is_landscape = (width > height);
     int long_side = is_landscape ? width : height;
     int short_side = is_landscape ? height : width;
     float original_ratio = static_cast<float>(long_side) / short_side;
+    
+    printf("🔥 SD_FIX_RESOLUTION DEBUG 3: ORIENTATION: %s, long_side=%d, short_side=%d, ratio=%.3f\n", 
+           is_landscape ? "landscape" : "portrait", long_side, short_side, original_ratio);
 
     // for the initial rounding, don't bother comparing to the original
     // requested ratio, since the user can choose those values directly
@@ -389,10 +408,18 @@ static void sd_fix_resolution(int &width, int &height, int img_hard_limit, int i
 
     //enforce sd_restrict_square area limit
     int area_limit = img_soft_limit * img_soft_limit;
+    printf("🔥 SD_FIX_RESOLUTION DEBUG 6: === AREA LIMIT CHECK ===\n");
+    printf("🔥 SD_FIX_RESOLUTION DEBUG 6a: area_limit = %d x %d = %d\n", img_soft_limit, img_soft_limit, area_limit);
+    printf("🔥 SD_FIX_RESOLUTION DEBUG 6b: current_area = %d x %d = %d\n", long_side, short_side, long_side * short_side);
+    
     if (long_side * short_side > area_limit) {
+        printf("🔥 SD_FIX_RESOLUTION DEBUG 6c: ❌ AREA EXCEEDED! %d > %d - SCALING DOWN!\n", long_side * short_side, area_limit);
         float scale = std::sqrt(static_cast<float>(area_limit) / (long_side * short_side));
+        printf("🔥 SD_FIX_RESOLUTION DEBUG 6d: scale_factor = sqrt(%d / %d) = %.6f\n", area_limit, long_side * short_side, scale);
+        
         int new_short = static_cast<int>(short_side * scale);
         int new_long = static_cast<int>(long_side * scale);
+        printf("🔥 SD_FIX_RESOLUTION DEBUG 6e: scaled dimensions: long=%d->%d, short=%d->%d\n", long_side, new_long, short_side, new_short);
 
         if (new_short <= 64) {
             short_side = 64;
@@ -435,6 +462,11 @@ static void sd_fix_resolution(int &width, int &height, int img_hard_limit, int i
         width = short_side;
         height = long_side;
     }
+    
+    printf("🔥 SD_FIX_RESOLUTION DEBUG 9: === FINAL RESULT ===\n");
+    printf("🔥 SD_FIX_RESOLUTION DEBUG 9a: OUTPUT: width=%d, height=%d\n", width, height);
+    printf("🔥 SD_FIX_RESOLUTION DEBUG 9b: Final area = %d pixels\n", width * height);
+    printf("🔥 SD_FIX_RESOLUTION DEBUG 9c: === END RESOLUTION FIXING ===\n\n");
 }
 
 sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
@@ -492,20 +524,58 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     // cannot exceed (832x832) for sd1/sd2 or (1024x1024) for sdxl/sd3/flux, to prevent crashing the server
     const int hard_megapixel_res_limit = (loadedsdver==SDVersion::VERSION_SD1 || loadedsdver==SDVersion::VERSION_SD2)?832:1024;
 
+    printf("\n🔥 RESOLUTION DEBUG 1: === RESOLUTION LIMITS CALCULATION ===\n");
+    printf("🔥 RESOLUTION DEBUG 1a: default_res_limit = %d\n", default_res_limit);
+    printf("🔥 RESOLUTION DEBUG 1b: hard_megapixel_res_limit = %d\n", hard_megapixel_res_limit);
+    printf("🔥 RESOLUTION DEBUG 1c: cfg_side_limit = %d\n", cfg_side_limit);
+    printf("🔥 RESOLUTION DEBUG 1d: cfg_square_limit = %d\n", cfg_square_limit);
+    printf("🔥 RESOLUTION DEBUG 1e: sddebugmode = %d\n", sddebugmode);
+    printf("🔥 RESOLUTION DEBUG 1f: loadedsdver = %d\n", (int)loadedsdver);
+
     int img_hard_limit = default_res_limit;
+    printf("🔥 RESOLUTION DEBUG 2: img_hard_limit initial = %d\n", img_hard_limit);
     if (cfg_side_limit > 0) {
+        int old_hard_limit = img_hard_limit;
         img_hard_limit = std::max(std::min(cfg_side_limit, default_res_limit), 64);
+        printf("🔥 RESOLUTION DEBUG 2a: cfg_side_limit > 0, changed img_hard_limit from %d to %d\n", old_hard_limit, img_hard_limit);
+    } else {
+        printf("🔥 RESOLUTION DEBUG 2b: cfg_side_limit <= 0, keeping img_hard_limit = %d\n", img_hard_limit);
     }
 
     int img_soft_limit = default_res_limit;
+    printf("🔥 RESOLUTION DEBUG 3: img_soft_limit initial = %d\n", img_soft_limit);
     if (cfg_square_limit > 0) {
+        int old_soft_limit = img_soft_limit;
         img_soft_limit = std::max(std::min(cfg_square_limit, default_res_limit), 64);
+        printf("🔥 RESOLUTION DEBUG 3a: cfg_square_limit > 0, changed img_soft_limit from %d to %d\n", old_soft_limit, img_soft_limit);
+    } else {
+        printf("🔥 RESOLUTION DEBUG 3b: cfg_square_limit <= 0, keeping img_soft_limit = %d\n", img_soft_limit);
     }
 
+    printf("🔥 RESOLUTION DEBUG 4: Before hard_megapixel_res_limit application:\n");
+    printf("🔥 RESOLUTION DEBUG 4a: img_soft_limit = %d\n", img_soft_limit);
+    printf("🔥 RESOLUTION DEBUG 4b: hard_megapixel_res_limit = %d\n", hard_megapixel_res_limit);
+
     if (cfg_square_limit > 0 && sddebugmode == 1) {
+        int old_soft_limit = img_soft_limit;
         img_soft_limit = std::min(hard_megapixel_res_limit * 2, img_soft_limit);  //double the limit for debugmode if cfg_square_limit is set
+        printf("🔥 RESOLUTION DEBUG 4c: DEBUG MODE: changed img_soft_limit from %d to %d (hard_limit*2=%d)\n", old_soft_limit, img_soft_limit, hard_megapixel_res_limit * 2);
     } else {
+        int old_soft_limit = img_soft_limit;
         img_soft_limit = std::min(hard_megapixel_res_limit, img_soft_limit);
+        printf("🔥 RESOLUTION DEBUG 4d: NORMAL MODE: changed img_soft_limit from %d to %d (hard_limit=%d)\n", old_soft_limit, img_soft_limit, hard_megapixel_res_limit);
+    }
+
+    printf("🔥 RESOLUTION DEBUG 5: FINAL LIMITS:\n");
+    printf("🔥 RESOLUTION DEBUG 5a: img_hard_limit = %d\n", img_hard_limit);
+    printf("🔥 RESOLUTION DEBUG 5b: img_soft_limit = %d\n", img_soft_limit);
+    printf("🔥 RESOLUTION DEBUG 5c: Area limit will be = %d x %d = %d pixels\n", img_soft_limit, img_soft_limit, img_soft_limit * img_soft_limit);
+    printf("🔥 RESOLUTION DEBUG 5d: Requested area = %d x %d = %d pixels\n", inputs.width, inputs.height, inputs.width * inputs.height);
+    
+    if (inputs.width * inputs.height > img_soft_limit * img_soft_limit) {
+        printf("🔥 RESOLUTION DEBUG 5e: ❌ AREA LIMIT EXCEEDED! %d > %d - DOWNSCALING WILL OCCUR!\n", inputs.width * inputs.height, img_soft_limit * img_soft_limit);
+    } else {
+        printf("🔥 RESOLUTION DEBUG 5f: ✅ Area limit OK, no downscaling needed\n");
     }
 
     sd_fix_resolution(sd_params->width, sd_params->height, img_hard_limit, img_soft_limit);
@@ -514,7 +584,17 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     }
 
     // trigger tiling by image area, the memory used for the VAE buffer is 6656 bytes per image pixel, default 768x768
+    printf("🔥 VAE TILING DEBUG 1: === VAE TILING CALCULATION ===\n");
+    printf("🔥 VAE TILING DEBUG 2: cfg_tiled_vae_threshold = %d\n", cfg_tiled_vae_threshold);
+    printf("🔥 VAE TILING DEBUG 3: Threshold area = %d x %d = %d pixels\n", cfg_tiled_vae_threshold, cfg_tiled_vae_threshold, cfg_tiled_vae_threshold * cfg_tiled_vae_threshold);
+    printf("🔥 VAE TILING DEBUG 4: Current image = %d x %d = %d pixels\n", sd_params->width, sd_params->height, sd_params->width * sd_params->height);
+    
     bool dotile = (sd_params->width*sd_params->height > cfg_tiled_vae_threshold*cfg_tiled_vae_threshold);
+    printf("🔥 VAE TILING DEBUG 5: Comparison: %d > %d ? %s\n", sd_params->width*sd_params->height, cfg_tiled_vae_threshold*cfg_tiled_vae_threshold, dotile ? "YES (tiling enabled)" : "NO (tiling disabled)");
+    printf("🔥 VAE TILING DEBUG 6: Memory per pixel = 6656 bytes\n");
+    printf("🔥 VAE TILING DEBUG 7: Estimated VAE memory = %d pixels * 6656 = %.2f MB\n", sd_params->width * sd_params->height, (sd_params->width * sd_params->height * 6656.0) / (1024*1024));
+    printf("🔥 VAE TILING DEBUG 8: Setting VAE tiling to: %s\n", dotile ? "ENABLED" : "DISABLED");
+    
     set_sd_vae_tiling(sd_ctx,dotile); //changes vae tiling, prevents memory related crash/oom
 
     if (sd_params->clip_skip <= 0) {

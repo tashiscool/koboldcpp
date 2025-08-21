@@ -1251,10 +1251,21 @@ def autoset_gpu_layers(ctxsize, sdquanted, bbs, qkv_level): #shitty algo to dete
                             showmultigpuwarning = False
                             print("Multi-Part GGUF detected. Layer estimates may not be very accurate - recommend setting layers manually.")
                         fsize *= total_parts
+            # Enhanced SD quantization memory calculation with backward compatibility
+            if isinstance(sdquanted, bool):
+                # Legacy boolean format compatibility
+                sdquantsavings = 2 if sdquanted else 0
+            elif isinstance(sdquanted, str):
+                # New string format
+                sdquantsavings = {'q4_0': 2, 'q8_0': 1}.get(sdquanted, 0)
+            else:
+                # Fallback for unknown types
+                sdquantsavings = 0
+            
             if modelfile_extracted_meta[3] > 1024*1024*1024*5: #sdxl tax
-                mem -= 1024*1024*1024*(6 if sdquanted else 9)
+                mem -= 1024*1024*1024*(9 - sdquantsavings * 1.5) # 9, 7.5, 6
             elif modelfile_extracted_meta[3] > 1024*1024*512: #normal sd tax
-                mem -= 1024*1024*1024*(3.25 if sdquanted else 4.25)
+                mem -= 1024*1024*1024*(4.25 - sdquantsavings * 0.5) # 4.25, 3.75, 3.25
             if modelfile_extracted_meta[4] > 1024*1024*10: #whisper tax
                 mem -= max(350*1024*1024,modelfile_extracted_meta[4]*1.5)
             if modelfile_extracted_meta[5] > 1024*1024*10: #mmproj tax
@@ -1757,23 +1768,49 @@ def generate(genparams, stream_flag=False):
                     outstr = outstr[:sindex]
         return {"text":outstr,"status":ret.status,"stopreason":ret.stopreason,"prompt_tokens":ret.prompt_tokens, "completion_tokens": ret.completion_tokens}
 
+sd_quant_choices = ['off', 'q8_0', 'q4_0']
+
+def sd_quant_option(value):
+    """Convert various SD quantization inputs to standardized string format"""
+    if not value:
+        value = ''
+    if isinstance(value, bool):
+        # Handle legacy boolean format
+        return 'q4_0' if value else 'off'
+    
+    value = str(value).lower()
+    if value in ['disabled', 'disable', 'none', 'off', '0', '', 'false']:
+        return 'off'
+    elif value in ['true', '1']: # compat old config
+        return 'q4_0'
+    elif value in sd_quant_choices:
+        return value
+    else:
+        print(f"Warning: Unsupported sdquant option '{value}'. Using 'off'. Valid options: {sd_quant_choices}")
+        return 'off'
 
 def sd_load_model(model_filename,vae_filename,lora_filename,t5xxl_filename,clipl_filename,clipg_filename,photomaker_filename):
     global args
     inputs = sd_load_model_inputs()
     inputs.model_filename = model_filename.encode("UTF-8")
     thds = args.threads
-    quant = 0
 
     if args.sdthreads and args.sdthreads > 0:
         sdt = int(args.sdthreads)
         if sdt > 0:
             thds = sdt
-    if args.sdquant:
-        quant = 1
 
     inputs.threads = thds
-    inputs.quant = quant
+    # Enhanced quantization system with error handling
+    try:
+        sd_quant_convert = {'off': -1, 'q8_0': 8, 'q4_0': 2}  # enum sd_type_t
+        quant_setting = sd_quant_option(args.sdquant)
+        inputs.quant = sd_quant_convert[quant_setting]
+        if args.debugmode and quant_setting != 'off':
+            print(f"SD Quantization: Using {quant_setting} (enum value: {inputs.quant})")
+    except Exception as e:
+        print(f"Warning: SD quantization setup failed: {e}. Using no quantization.")
+        inputs.quant = -1  # fallback to off
     inputs.flash_attention = args.flashattention
     inputs.taesd = True if args.sdvaeauto else False
     inputs.tiled_vae_threshold = args.sdtiledvae
@@ -1794,14 +1831,27 @@ def sd_load_model(model_filename,vae_filename,lora_filename,t5xxl_filename,clipl
     inputs.clipl_filename = clipl_filename.encode("UTF-8")
     inputs.clipg_filename = clipg_filename.encode("UTF-8")
     inputs.photomaker_filename = photomaker_filename.encode("UTF-8")
-    inputs.img_hard_limit = args.sdclamped
-    inputs.img_soft_limit = args.sdclampedsoft
+    # Enhanced resolution parameter validation to prevent corruption bug
+    validated_hard_limit = max(512, min(args.sdclamped or 1024, 8192))
+    validated_soft_limit = max(512, min(args.sdclampedsoft or 1024, 8192))
+    
+    # Critical validation - ensure parameters are reasonable to prevent cfg_square_limit=1 corruption
+    if validated_soft_limit < 64 or validated_soft_limit > 8192:
+        print(f"🚨 WARNING: Invalid img_soft_limit={validated_soft_limit}, using safe default 1024")
+        validated_soft_limit = 1024
+    if validated_hard_limit < 64 or validated_hard_limit > 8192:
+        print(f"🚨 WARNING: Invalid img_hard_limit={validated_hard_limit}, using safe default 1024")
+        validated_hard_limit = 1024
+    
+    inputs.img_hard_limit = validated_hard_limit
+    inputs.img_soft_limit = validated_soft_limit
     inputs.debugmode = args.debugmode
+    
     print(f"🔧 SD LOAD CRITICAL: === PASSING RESOLUTION LIMITS TO C++ ===")
-    print(f"🔧 SD LOAD CRITICAL: img_hard_limit = {args.sdclamped} (prevents >1024px sides)")
-    print(f"🔧 SD LOAD CRITICAL: img_soft_limit = {args.sdclampedsoft} (prevents memory scaling)")
+    print(f"🔧 SD LOAD CRITICAL: img_hard_limit = {validated_hard_limit} (prevents >1024px sides)")
+    print(f"🔧 SD LOAD CRITICAL: img_soft_limit = {validated_soft_limit} (prevents memory scaling)")
     print(f"🔧 SD LOAD CRITICAL: debugmode = {args.debugmode}")
-    print(f"🔧 SD LOAD CRITICAL: These values PREVENT 64x64 scaling bug!")
+    print(f"🔧 SD LOAD CRITICAL: Validation prevents cfg_square_limit=1 corruption!")
     print(f"🔧 SD LOAD CRITICAL: === C++ HANDOFF COMPLETE ===")
     inputs = set_backend_props(inputs)
     ret = handle.sd_load_model(inputs)
